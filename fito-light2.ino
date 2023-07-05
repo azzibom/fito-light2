@@ -2,10 +2,12 @@
 #include <EEManager.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <GyverNTP.h>
 
+#define TIMERS_COUNT 3
 #define SERVER_PORT 80
 #define AP_SSID "FitoLight"
-#define AP_PASS "12345678"
+#define AP_PASS "12345678" 
 #define HOSTNAME "fitolight.local"
 
 const char SP_index_page[] PROGMEM = R"rawliteral(
@@ -145,13 +147,20 @@ struct TgSet {
   char token[50];
   int64_t chat = 0;
 };
+struct Timer {
+  bool on = false;
+  int hour;
+  int minutes;
+};
 struct Settings {
   WifiSet wifi;
   TgSet tg;
+  Timer timers[TIMERS_COUNT];
 } settings;
 EEManager memory(settings);
 ESP8266WebServer server(SERVER_PORT);
 FastBot bot;
+GyverNTP ntp(3); // todo вынести часовой пояс в настройки
 
 void setup() {
   Serial.begin(115200);
@@ -161,6 +170,7 @@ void setup() {
   runWifi();
   runServer();
   runTg();
+  ntp.begin();
 }
 
 void loop() {
@@ -168,6 +178,7 @@ void loop() {
   if (settings.tg.on) {
     bot.tick();
   }
+  ntp.tick();
 }
 
 // fun
@@ -329,19 +340,32 @@ void handleNotFound() {
 // status
 
 void handleStatus() {
+  String timersJson = "[";
+
+  int timersCount = TIMERS_COUNT
+  for (int i = 0; i < timersCount; i++) {
+    Timer t = settings.timers[i];
+    
+    String timerJson = "{";
+    timerJson += "\"on\": "; timerJson += t.on ? "true" : "false"; timerJson += ";"
+    timerJson += "\"hour\": "; timerJson += t.hour; timerJson += ",";
+    timerJson += "\"minutes\": "; timerJson += t.minutes; // timerJson += ",";
+    timerJson += "}";
+
+    timersJson += timerJson;
+    if (i < TIMERS_COUNT - 1) {
+      timersJson += ",";
+    }
+  }
+
+  timersJson += "]";
+
   String message = "{\n";
-  message += "  \"mode\": \"";
-  message += WiFi.getMode() == 1 ? "STA" : "AP";
-  message += "\",\n";
-  message += "  \"ssid\": \"";
-  message += settings.wifi.ssid;
-  message += "\",\n";
-  message += "  \"tg\": \"";
-  message += strlen(settings.tg.token) != 0 ? "on" : "off";
-  message += "\",\n";
-  message += "  \"chat\": \"";
-  message += settings.tg.chat;
-  message += "\"\n";
+  message += "\"mode\": \""; message += WiFi.getMode() == 1 ? "STA" : "AP"; message += "\",";
+  message += "\"ssid\": \""; message += settings.wifi.ssid; message += "\",";
+  message += "\"tg\": \""; message += strlen(settings.tg.token) != 0 ? "on" : "off"; message += "\",";
+  message += "\"chat\": \""; message += settings.tg.chat; message += "\",";
+  message += "\"timers\": "; message += timersJson;
   message += "}";
   server.send(200, "application/json", message);
 }
