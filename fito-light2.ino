@@ -3,10 +3,14 @@
 #include <GyverNTP.h>
 #include <FastBot.h>
 
+// = DEFINE ===
 #define APP_TITLE "FitoLight2"
 #define AP_PASS "12345687"
 #define TIMER_COUNT 3 // кол-во таймеров
+#define MEM_KEY 251 // ключ сброса памяти
+#define GMT 3 // часовой пояс
 
+// = STRUCT ===
 struct WifiCfg {
   char ssid[20];
   char pass[20];
@@ -30,12 +34,135 @@ struct Cfg {
   Timer timers[TIMER_COUNT];
 } CFG;
 
+// = VAR ===
 EEManager memory(CFG);
 GyverPortal ui;
-GyverNTP ntp(3);
+GyverNTP ntp(GMT);
 FastBot bot;
 
-// == ui ===
+// = main ==
+void setup() {
+  // pre init begin
+  delay(2000);
+
+  Serial.begin(115200);
+  Serial.println();
+
+  pinMode(LED_BUILTIN, OUTPUT);
+  // pre init end
+  readSettings(); // читаем из памяти
+  runWifi(); // запускаем wifi
+  
+  ui.attachBuild(buildUI);
+  ui.start(APP_TITLE);
+  ui.attach(uiCallback);
+
+  ntp.begin();
+
+  // == bot ==
+  Serial.println("== Tg bot starting... ==");
+  bot.setToken(CFG.tg.token);
+  bot.setChatID(CFG.tg.chatId);
+  bot.skipUpdates();
+  bot.attach(tgCallback);
+  bot.showMenuText("Я снова в деле", "/вкл \t /выкл \t /статус");
+  Serial.println("== Tg bot started ==");
+}
+
+bool begin = false; // флаг необходимости вкл/выключить подсветку по таймеру 
+void loop() {
+  // = tick begin =
+  ui.tick();
+  ntp.tick();
+  bot.tick();
+  // = tick end =
+
+  lightTimerLoop();
+}
+
+void lightTimerLoop() { // обработка таймеров подсветки
+  for (int i = 0; i < TIMER_COUNT; i++) { 
+    Timer t = CFG.timers[i];
+    if (ntp.hour() == t.begin.hour && ntp.minute() == t.begin.minute && !begin) {
+      switchLed(true);
+      Serial.println("alarm on");
+      begin = true;
+    } 
+    if (ntp.hour() == t.end.hour && ntp.minute() == t.end.minute && begin) {
+      switchLed(false);
+      Serial.println("alarm off");
+      begin = false;
+    }
+  }
+}
+
+// = led ======
+bool ledStatus() {
+  return !digitalRead(LED_BUILTIN);
+}
+
+void switchLed(bool on, bool sendAnswerToTg) {
+  digitalWrite(LED_BUILTIN, !on);
+   if (sendAnswerToTg) {
+    sendBotLedState();
+  }
+}
+
+void switchLed(bool on) {
+  switchLed(on, true);
+}
+
+// = memory ===
+void readSettings() { // читаем настройки
+  EEPROM.begin(memory.blockSize());
+  memory.begin(0, 251);
+}
+
+// = wifi =====
+void startAP() { // подымаем точку AP
+  Serial.println("== AP starting... ==");
+  // запускаем точку доступа
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(APP_TITLE, AP_PASS);
+  Serial.println("== AP started... ==");
+}
+
+void runWifi() { // запускаем WiFi
+  Serial.println("== Wifi starting... ==");
+  WiFi.setAutoConnect(true);
+  if (strlen(CFG.wifi.ssid) == 0) {
+    startAP();
+  } else {
+    // пытаемся подключиться
+    Serial.print("Connect to: ");
+    Serial.println(CFG.wifi.ssid);
+    WiFi.mode(WIFI_STA);
+    if (strlen(CFG.wifi.pass) == 0) {
+      WiFi.begin(CFG.wifi.ssid);
+    } else {
+      WiFi.begin(CFG.wifi.ssid, CFG.wifi.pass);
+    }
+
+    long now = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+      if (millis() - now >= 30000) break;  // даем на подключение (сек)
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+      startAP();
+    } else {
+      Serial.println();
+      Serial.print("Connected! Local IP: ");
+      Serial.println(WiFi.localIP());
+      
+    }
+    Serial.println("== Wifi started ==");
+  }
+}
+
+// = ui =======
 void buildUI() {
   GP.BUILD_BEGIN();
 
@@ -97,84 +224,7 @@ void buildClockUI(Clock c, String prefix) {
   GP.BOX_END();
 }
 
-void readSettings() {
-  EEPROM.begin(memory.blockSize());
-  memory.begin(0, 251);
-}
-
-void startAP() {
-  Serial.println("== AP starting... ==");
-  // запускаем точку доступа
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(APP_TITLE, AP_PASS);
-  Serial.println("== AP started... ==");
-}
-
-void runWifi() {
-  Serial.println("== Wifi starting... ==");
-  WiFi.setAutoConnect(true);
-  if (strlen(CFG.wifi.ssid) == 0) {
-    startAP();
-  } else {
-    // пытаемся подключиться
-    Serial.print("Connect to: ");
-    Serial.println(CFG.wifi.ssid);
-    WiFi.mode(WIFI_STA);
-    if (strlen(CFG.wifi.pass) == 0) {
-      WiFi.begin(CFG.wifi.ssid);
-    } else {
-      WiFi.begin(CFG.wifi.ssid, CFG.wifi.pass);
-    }
-
-    long now = millis();
-    while (WiFi.status() != WL_CONNECTED) {
-      delay(500);
-      Serial.print(".");
-      if (millis() - now >= 30000) break;  // даем на подключение (сек)
-    }
-
-    if (WiFi.status() != WL_CONNECTED) {
-      startAP();
-    } else {
-      Serial.println();
-      Serial.print("Connected! Local IP: ");
-      Serial.println(WiFi.localIP());
-      
-    }
-    Serial.println("== Wifi started ==");
-  }
-}
-
-// == main
-void setup() {
-  // pre init begin
-  delay(2000);
-
-  Serial.begin(115200);
-  Serial.println();
-
-  pinMode(LED_BUILTIN, OUTPUT);
-  // pre init end
-  readSettings(); // читаем из памяти
-  runWifi(); // запускаем wifi
-  
-  ui.attachBuild(buildUI);
-  ui.start(APP_TITLE);
-  ui.attach(action);
-
-  ntp.begin();
-
-  // == bot ==
-  Serial.println("== Tg bot starting... ==");
-  bot.setToken(CFG.tg.token);
-  bot.setChatID(CFG.tg.chatId);
-  bot.skipUpdates();
-  bot.attach(tgCallback);
-  bot.showMenuText("Я снова в деле", "/вкл \t /выкл \t /статус");
-  Serial.println("== Tg bot started ==");
-}
-
-void action(GyverPortal& p) {
+void uiCallback(GyverPortal& p) { // обработка запросов с ui
   if (p.form("/wifi")) {               // кнопка нажата
     p.copyStr("ssid", CFG.wifi.ssid);  // копируем себе
     p.copyStr("pass", CFG.wifi.pass);
@@ -239,7 +289,8 @@ void action(GyverPortal& p) {
   }
 }
 
-void tgCallback(FB_msg& msg) {
+// = tg =======
+void tgCallback(FB_msg& msg) { // обработка запросов с tg
   String text = msg.text;
   if (text == "/start") {
     String mess = "Добро пожаловать!";
@@ -267,48 +318,10 @@ void tgCallback(FB_msg& msg) {
   }
 }
 
-void sendBotLedState() {
+void sendBotLedState() { // отправка состояния в TG
   if (ledStatus() == true) {
     bot.sendMessage("Включено");
   } else {
     bot.sendMessage("Выключено");
   }
-}
-
-bool begin = false;
-void loop() {
-  ui.tick();
-  ntp.tick();
-  bot.tick();
-
-  // обработка таймеров
-  for (int i = 0; i < TIMER_COUNT; i++) { 
-    Timer t = CFG.timers[i];
-    if (ntp.hour() == t.begin.hour && ntp.minute() == t.begin.minute && !begin) {
-      switchLed(true);
-      Serial.println("alarm on");
-      begin = true;
-    } 
-    if (ntp.hour() == t.end.hour && ntp.minute() == t.end.minute && begin) {
-      switchLed(false);
-      Serial.println("alarm off");
-      begin = false;
-    } 
-  }
-}
-
-// ========================================
-bool ledStatus() {
-  return !digitalRead(LED_BUILTIN);
-}
-
-void switchLed(bool on, bool sendAnswerToTg) {
-  digitalWrite(LED_BUILTIN, !on);
-   if (sendAnswerToTg) {
-    sendBotLedState();
-  }
-}
-
-void switchLed(bool on) {
-  switchLed(on, true);
 }
