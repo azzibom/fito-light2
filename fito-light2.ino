@@ -1,14 +1,32 @@
 #include <GyverPortal.h>
-#include <EEManager.h>
+#include <FileData.h>
+#include <LittleFS.h>
 #include <GyverNTP.h>
 #include <FastBot.h>
+
+/*
+Прошивка для управления фитолентой.
+- управление по web ui и tg
+- установка таймеров на вкл/выкл
+- настройка wifi/tg/таймеров с сохранением
+- синхронизация времени
+
+TODO
+- вынести настройку часового пояса
+- загрузка и выгрузка файла настроек ui и tg
+- настройка таймеров через tg
+- обновление прошивки через ui и tg
+- вывод информации о состоянии, текущем времени и тд в ui и tg
+*/
 
 // = DEFINE ===
 #define APP_TITLE "FitoLight2"
 #define AP_PASS "12345687"
 #define TIMER_COUNT 3 // кол-во таймеров
-#define MEM_KEY 251 // ключ сброса памяти
+#define MEM_KEY 'A' // ключ сброса памяти
 #define GMT 3 // часовой пояс
+#define TOUT 10000 // таймаут сохранения данных
+#define REL_PIN D1 // тин
 
 // = STRUCT ===
 struct WifiCfg {
@@ -35,7 +53,8 @@ struct Cfg {
 } CFG;
 
 // = VAR ===
-EEManager memory(CFG);
+// EEManager memory(CFG);
+FileData data(&LittleFS, "/settings.dat", MEM_KEY, &CFG, sizeof(CFG), 10000);
 GyverPortal ui;
 GyverNTP ntp(GMT);
 FastBot bot;
@@ -75,6 +94,7 @@ void loop() {
   ui.tick();
   ntp.tick();
   bot.tick();
+  data.tick();
   // = tick end =
 
   lightTimerLoop();
@@ -114,8 +134,17 @@ void switchLed(bool on) {
 
 // = memory ===
 void readSettings() { // читаем настройки
-  EEPROM.begin(memory.blockSize());
-  memory.begin(0, 251);
+  LittleFS.begin();
+  FDstat_t stat = data.read();
+
+  switch (stat) {
+    case FD_FS_ERR: Serial.println("FS Error"); break;
+    case FD_FILE_ERR: Serial.println("Error"); break;
+    case FD_WRITE: Serial.println("Data Write"); break;
+    case FD_ADD: Serial.println("Data Add"); break;
+    case FD_READ: Serial.println("Data Read"); break;
+    default: break;
+  }
 }
 
 // = wifi =====
@@ -225,21 +254,36 @@ void buildClockUI(Clock c, String prefix) {
 }
 
 void uiCallback(GyverPortal& p) { // обработка запросов с ui
+  wifiFormAction(p);
+  tgFormAction(p); 
+  timerFormAction(p);
+
+  ledSwitchAction(p);
+  updateDynamycElsAction(p);
+}
+
+void wifiFormAction(GyverPortal& p) { // обратотка формы wifi
   if (p.form("/wifi")) {               // кнопка нажата
     p.copyStr("ssid", CFG.wifi.ssid);  // копируем себе
     p.copyStr("pass", CFG.wifi.pass);
-    memory.updateNow();
+    data.update();
     WiFi.softAPdisconnect();  // отключаем AP
   }
+}
+
+void tgFormAction(GyverPortal& p) { // обработка формы телеграм
   if (p.form("/tg")) {
     p.copyStr("token", CFG.tg.token);
     p.copyInt("chatId", CFG.tg.chatId);
-    memory.updateNow();
+    data.update();
     bot.setToken(CFG.tg.token);
     bot.setChatID(CFG.tg.chatId);
     Serial.print("token: "); Serial.println(CFG.tg.token);
     Serial.print("chatId: "); Serial.print(CFG.tg.chatId);
-  } 
+  }
+}
+
+void timerFormAction(GyverPortal& p) { // обратотка формы таймера
   if (p.form("/timer")) {
     int timerNum = -1;
     p.copyInt("timer", timerNum);
@@ -273,17 +317,21 @@ void uiCallback(GyverPortal& p) { // обработка запросов с ui
       Serial.print(":");
       Serial.println(CFG.timers[timerNum].end.minute);
       Serial.println("===========");
-      memory.updateNow();
+      data.update();
     }
   }
+}
 
+void ledSwitchAction(GyverPortal& p) { // обратотка переключения  
   bool valSwitch;
   if (ui.clickBool("ledSwitch", valSwitch)) {
     Serial.print("Switch: ");
     Serial.println(valSwitch);
     switchLed(valSwitch);
   }
+}
 
+void updateDynamycElsAction(GyverPortal& p) { // обновление динамических эл-ов на ui
   if (ui.update("ledSwitch")) {
     ui.updateBool("ledSwitch", ledStatus());
   }
