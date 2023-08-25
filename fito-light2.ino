@@ -1,383 +1,436 @@
+#include <GyverPortal.h>
+#include <FileData.h>
+#include <LittleFS.h>
+#include <GyverNTP.h>
 #include <FastBot.h>
-#include <EEManager.h>
-#include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
+// #include <ESP8266NetBIOS.h>
 
-#define SERVER_PORT 80
-#define AP_SSID "FitoLight"
-#define AP_PASS "12345678"
-#define HOSTNAME "fitolight.local"
+/*
+Прошивка для управления фитолентой.
+версия 2.1
+- управление по web ui и tg
+- установка таймеров на вкл/выкл (через web ui)
+- настройка wifi/tg/таймеров с сохранением в ФС
+- синхронизация времени через интернет
 
-const char SP_index_page[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <meta http-equiv="X-UA-Compatible" content="IE=edge">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FitoLight</title>
+TODO
+- вынести настройку часового пояса
+- вынести настройку имени хоста
+- загрузка и выгрузка файла настроек ui и tg
+- настройка таймеров через tg
+- обновление прошивки через ui и tg
+- вывод информации о состоянии, текущем времени и тд в ui и tg
+*/
 
-    <style>
-        .container {
-            max-width: 400px;
-            margin: 0 auto;
-            text-align: center;
-            font-family: sans-serif;
-        }
-        #switchBtn {
-            padding: 20px;
-            font-size: large;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>FitoLight</h1>
-        <button id="switchBtn" disabled>Вкл/Выкл</button>
-        <hr>
-        <a href="/settings">Настройки</a>
-    </div>
+// = DEFINE ===
+#define APP_TITLE "FitoLight2"
+#define HOSTNAME "fito-light2"
+#define AP_PASS "12345687" // !!
+#define TIMER_COUNT 3 // кол-во таймеров
+#define MEM_KEY 'A' // ключ сброса памяти
+#define GMT 3 // часовой пояс
+#define TOUT 10000 // таймаут сохранения данных
+#define REL_PIN D1 // пин
 
-    <script>
-        let ledState = undefined
-
-        function setBtnState(state) {
-            ledState = state === 'on' ? "ON" : "OFF"
-            if (ledState === "ON") {
-                switchBtn.innerText = "Вкл"
-            } else {
-                switchBtn.innerText = "Выкл"
-            }
-        }
-
-        const switchBtn = document.getElementById('switchBtn')
-        switchBtn.addEventListener('click', e => {
-            switchBtn.disabled = true
-            const param = ledState === "ON" ? "off" : "on"
-            fetch(`/led/switch?state=${param}`)
-                .then(resp => resp.text())
-                .then(text => {
-                    setBtnState(text)
-                    switchBtn.disabled = false
-                })
-        })
-
-        function fetchLedState() {
-            fetch('/led/state')
-                .then(resp => resp.text())
-                .then(text => {
-                    setBtnState(text)
-                    switchBtn.disabled = false
-                })
-            setTimeout(fetchLedState, 3000)
-        }
-        fetchLedState()
-
-
-    </script>
-</body>
-</html>
-)rawliteral";
-
-const char SP_settings_page[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport"
-          content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0">
-    <meta http-equiv="X-UA-Compatible" content="ie=edge">
-    <title>Settings</title>
-    <style>
-        body {
-            font-family: sans-serif;
-            text-align: center;
-            width: 25%;
-            margin: 0 auto;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-        }
-
-        form, fieldset {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-        }
-
-        form * {
-            margin-bottom: 5px;
-        }
-    </style>
-</head>
-<body>
-<div class="cont">
-    <h1><a href="/">FitoLight</a></h1>
-    <h2>Настройки</h2>
-    <fieldset>
-        <legend>WiFi</legend>
-        <form action="/wifi" method="post">
-            <input name="ssid" placeholder="ssid" required>
-            <input type="password" name="pass" placeholder="password" required>
-            <button type="submit">Подключится</button>
-        </form>
-    </fieldset>
-    <fieldset>
-        <legend>Tg</legend>
-        <form action="/tg" method="post">
-            <input name="token" placeholder="token" required>
-            <input name="chat_id" placeholder="chat id">
-            <button type="submit">Подключится</button>
-        </form>
-    </fieldset>
-</div>
-</body>
-</html>
-)rawliteral";
-
-struct WifiSet {
-  char ssid[32];
-  char pass[32];
+// = STRUCT ===
+struct WifiCfg {
+  char ssid[20];
+  char pass[20];
 };
-
-struct TgSet {
-  bool on = false;
+struct TgCfg {
   char token[50];
-  int64_t chat = 0;
+  uint64_t chatId;
 };
-struct Settings {
-  WifiSet wifi;
-  TgSet tg;
-} settings;
-EEManager memory(settings);
-ESP8266WebServer server(SERVER_PORT);
+struct Clock {
+  int8_t hour = 12;
+  int8_t minute = 0;
+};
+struct Timer {
+  bool on = false;
+  Clock begin;
+  Clock end;
+};
+struct Cfg {
+  WifiCfg wifi;
+  TgCfg tg;
+  Timer timers[TIMER_COUNT];
+} CFG;
+
+// = VAR ===
+FileData data(&LittleFS, "/settings.dat", MEM_KEY, &CFG, sizeof(CFG), 10000);
+GyverPortal ui;
+GyverNTP ntp(GMT);
 FastBot bot;
 
+// = main ==
 void setup() {
+  // pre init begin
+  delay(2000);
+
   Serial.begin(115200);
-  pinMode(LED_BUILTIN, OUTPUT);
+  Serial.println();
 
-  readSettings();
-  runWifi();
-  runServer();
-  runTg();
+  pinMode(REL_PIN, OUTPUT);
+  // pre init end
+  readSettings(); // читаем из памяти
+  runWifi(); // запускаем wifi
+
+  // конфигурируем ui
+  ui.attachBuild(buildUI);
+  ui.start(HOSTNAME);
+  ui.setFS(&LittleFS);
+  ui.attach(uiCallback);
+
+  ntp.begin(); // запускаем синхронизацию времени
+
+  // == конфигурируем tg бота ==
+  Serial.println("== Tg bot starting... ==");
+  bot.setToken(CFG.tg.token);
+  bot.setChatID(CFG.tg.chatId);
+  bot.skipUpdates();
+  bot.attach(tgCallback);
+  bot.showMenuText("Я снова в деле", "/вкл \t /выкл \t /статус");
+  Serial.println("== Tg bot started ==");
 }
 
+bool begin = false; // флаг необходимости вкл/выключить подсветку по таймеру 
 void loop() {
-  server.handleClient();
-  if (settings.tg.on) {
-    bot.tick();
-  }
+  // = tick begin =
+  ui.tick();
+  ntp.tick();
+  bot.tick();
+  data.tick();
+  // = tick end =
+
+  lightTimerLoop();
 }
 
-// fun
-
-void readSettings() {
-  Serial.println("settings reading...");
-  EEPROM.begin(memory.blockSize());
-  memory.begin(0, 253);
-  Serial.println("settings readed");
-}
-
-void runWifi() {
-  Serial.println("WiFi starting...");
-  WiFi.softAPdisconnect();
-  if (strlen(settings.wifi.ssid) != 0) {
-    WiFi.mode(WIFI_STA);
-    WiFi.hostname(HOSTNAME);
-    if (strlen(settings.wifi.pass) == 0) {
-      WiFi.begin(settings.wifi.ssid);
-    } else {
-      WiFi.begin(settings.wifi.ssid, settings.wifi.pass);
-    }
-    while (WiFi.status() != WL_CONNECTED) {
-      delay(500);
-      if (millis() > 30000) break;  // даем на подключение 30 сек
+void lightTimerLoop() { // обработка таймеров подсветки
+  for (int i = 0; i < TIMER_COUNT; i++) { 
+    Timer t = CFG.timers[i];
+    if (ntp.hour() == t.begin.hour && ntp.minute() == t.begin.minute && !begin) {
+      switchLed(true);
+      Serial.println("alarm on");
+      begin = true;
+    } 
+    if (ntp.hour() == t.end.hour && ntp.minute() == t.end.minute && begin) {
+      switchLed(false);
+      Serial.println("alarm off");
+      begin = false;
     }
   }
-  if (strlen(settings.wifi.ssid) == 0 || WiFi.status() != WL_CONNECTED) {
-    WiFi.hostname(HOSTNAME);
-    WiFi.softAP(AP_SSID, AP_PASS);
-  } else {
-    Serial.println(WiFi.localIP());
-  }
-  Serial.println("WiFi started");
 }
 
-void runServer() {  // запускаю сервер
-  Serial.println("WebServer starting...");
-  server.onNotFound(handleNotFound);
-  // странички
-  server.on("/", handleRoot);
-  // server.on("/settings", handleSettings);
-
-  // подсветка
-  server.on("/led/switch", handleLedSwitch);  // /led/switch?state={on/off}
-  server.on("/led/state", handleLedState);    // /led/state text/plane {on/off}
-
-  // настройки
-  server.on("/wifi", handleWifi);      // /wifi?ssid={ssid}&pass={pass}
-  server.on("/tg", handleTg);          // /tg?token={token}&chat={chat}&state={on/off}
-  server.on("/reset", handleReset);    // /reset?accept=true
-  server.on("/status", handleStatus);  //
-
-  server.enableCORS(true);
-  server.begin();
-
-  Serial.println("WebServer started");
+// = led ======
+bool ledStatus() {
+  return digitalRead(REL_PIN);
 }
 
-void runTg() {
-  if (settings.tg.on) {
-    Serial.println("Tg bot starting...");
-    bot.setToken(settings.tg.token);
-    bot.setChatID(settings.tg.chat);
-    bot.skipUpdates();
-    bot.attach(handleTgMessage);
-    bot.showMenuText("Я снова в деле", "/вкл \t /выкл \t /статус");
-    Serial.println("Tg bot started");
-
-  }
-}
-
-// ==
-
-void switchLED(bool on, bool sendAnswerToTg) {
-  digitalWrite(LED_BUILTIN, !on);
-  if (sendAnswerToTg) {
+void switchLed(bool on, bool sendAnswerToTg) {
+  digitalWrite(REL_PIN, on);
+   if (sendAnswerToTg) {
     sendBotLedState();
   }
 }
 
-bool ledStatus() {
-  return !digitalRead(LED_BUILTIN);
+void switchLed(bool on) {
+  switchLed(on, true);
 }
 
-// ==
+// = memory ===
+void readSettings() { // читаем настройки
+  LittleFS.begin();
+  FDstat_t stat = data.read();
 
-void handleLedSwitch() {  // вкл/выкл подсветку
-  if (server.hasArg("state")) {
-    String state = server.arg("state");
-    switchLED(state == "on", true);
-  }
-  handleLedState();
-}
-
-void handleLedState() {  // состояние подвсетки
-  bool ledStatus = !digitalRead(LED_BUILTIN);
-  server.send(200, "text/plane", ledStatus ? "on" : "off");
-}
-
-// wifi endpoints
-void handleWifi() {  // подключаемся к wifi, передаем ssid и пароль
-  if (!(server.hasArg("ssid") && server.hasArg("pass"))) {
-    server.send(400, "text/plan", "укажите параметры ssid и pass для подключения к wifi или mode для смены режима работы");
-  }
-
-  if (server.hasArg("ssid") && server.hasArg("pass")) {
-    strcpy(settings.wifi.ssid, server.arg("ssid").c_str());
-    strcpy(settings.wifi.pass, server.arg("pass").c_str());
-  }
-  memory.updateNow();
-  server.send(200, "text/plan", "устройство будет перезагружено");
-  ESP.restart();
-}
-
-// tg
-void handleTg() {  // настройка телеги
-  if (!(server.hasArg("token") || server.hasArg("chat"))) {
-    server.send(400, "text/plan", "укажите хотябы один параметр: token={token} chat={chat_id}");
-    return;
-  }
-
-  if (server.hasArg("token")) {
-    strcpy(settings.tg.token, server.arg("token").c_str());
-    settings.tg.on = true;
-    bot.setToken(settings.tg.token);
-  }
-  if (server.hasArg("chat")) {
-    settings.tg.chat = server.arg("chat").toInt();
-    bot.setChatID(settings.tg.chat);
-  }
-  memory.updateNow();
-}
-
-void handleReset() {  // сбросить настройки
-  if (server.hasArg("accept") && server.arg("accept") == "true") {
-    memory.reset();
-    server.send(200, "text/plan", "reseting...");
-    ESP.restart();
+  switch (stat) {
+    case FD_FS_ERR: Serial.println("FS Error"); break;
+    case FD_FILE_ERR: Serial.println("Error"); break;
+    case FD_WRITE: Serial.println("Data Write"); break;
+    case FD_ADD: Serial.println("Data Add"); break;
+    case FD_READ: Serial.println("Data Read"); break;
+    default: break;
   }
 }
 
-// pages
-
-void handleRoot() {
-  server.send(200, "text/html", SP_index_page);
+// = wifi =====
+void startAP() { // подымаем точку AP
+  Serial.println("== AP starting... ==");
+  // запускаем точку доступа
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(APP_TITLE, AP_PASS);
+  Serial.println("== AP started... ==");
 }
 
-// void handleSettings() {
-//  server.send(200, "text/html", SP_settings_page);
-// }
+void runWifi() { // запускаем WiFi
+  Serial.println("== Wifi starting... ==");
+  WiFi.softAPdisconnect();
+  // WiFi.setAutoConnect(true);
+  WiFi.setAutoReconnect(true);
+  WiFi.hostname(HOSTNAME);
+  if (strlen(CFG.wifi.ssid) == 0) {
+    startAP();
+  } else {
+    // пытаемся подключиться
+    Serial.print("Connect to: ");
+    Serial.println(CFG.wifi.ssid);
+    WiFi.mode(WIFI_STA);
+    if (strlen(CFG.wifi.pass) == 0) {
+      WiFi.begin(CFG.wifi.ssid);
+    } else {
+      WiFi.begin(CFG.wifi.ssid, CFG.wifi.pass);
+    }
 
-void handleNotFound() {
-  server.sendHeader("Location", "/", true);
-  server.send(302, "text/plane", "");
-  // server.send(200, "application/json", "{}");
+    long now = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+      if (millis() - now >= 30000) break;  // даем на подключение (сек)
+    }
+    Serial.println();
+
+    if (WiFi.status() != WL_CONNECTED) {
+      startAP();
+    } else {
+      Serial.print("Connected! Local IP: ");
+      Serial.println(WiFi.localIP());
+      
+    }
+    Serial.println("== Wifi started ==");
+
+    // NBNS.begin(HOSTNAME);
+  }
 }
 
-// status
+// = ui =======
+void buildUI() {
+  GP.BUILD_BEGIN();
 
-void handleStatus() {
-  String message = "{\n";
-  message += "  \"mode\": \"";
-  message += WiFi.getMode() == 1 ? "STA" : "AP";
-  message += "\",\n";
-  message += "  \"ssid\": \"";
-  message += settings.wifi.ssid;
-  message += "\",\n";
-  message += "  \"tg\": \"";
-  message += strlen(settings.tg.token) != 0 ? "on" : "off";
-  message += "\",\n";
-  message += "  \"chat\": \"";
-  message += settings.tg.chat;
-  message += "\"\n";
-  message += "}";
-  server.send(200, "application/json", message);
+  GP.PAGE_TITLE(APP_TITLE);
+  GP.THEME(GP_DARK);
+  GP.TITLE(APP_TITLE);
+  // LED
+  GP.BLOCK_BEGIN(GP_TAB, "");
+  GP.SWITCH("ledSwitch", ledStatus());
+  GP.BLOCK_END();
+  // WiFi
+  GP.BLOCK_BEGIN(GP_TAB, "", "WiFi");
+  GP.FORM_BEGIN("/wifi");
+  GP.TEXT("ssid", "SSID", CFG.wifi.ssid);
+  GP.BREAK();
+  GP.TEXT("pass", "Password", CFG.wifi.pass);
+  GP.SUBMIT("Connect");
+  GP.FORM_END();
+  GP.BLOCK_END();
+  // Tg
+  GP.BLOCK_BEGIN(GP_TAB, "", "Tg");
+  GP.FORM_BEGIN("/tg");
+  GP.TEXT("token", "Token", CFG.tg.token);
+  GP.BREAK();
+  GP.TEXT("chatId", "ChatID", String(CFG.tg.chatId));
+  GP.SUBMIT("Save");
+  GP.FORM_END();
+  GP.BLOCK_END();
+
+  GP.BLOCK_BEGIN(GP_TAB, "", "Timers");
+  for (int i = 0; i < TIMER_COUNT; i++) {
+    Timer timer = CFG.timers[i];
+    String title = "#"; title += i;
+    GP.BLOCK_BEGIN(GP_TAB, "", title);
+    GP.FORM_BEGIN("/timer");
+    String onPref = "on"; onPref += i;
+    GP.SWITCH(onPref, timer.on);
+    GP.BREAK();
+    String beginPref = "begin"; beginPref += i; 
+    String endPref = "end"; endPref += i; 
+    buildClockUI(timer.begin, beginPref);
+    buildClockUI(timer.end, endPref);
+    GP.HIDDEN("timer", String(i));
+    GP.SUBMIT_MINI("Save");
+    GP.FORM_END();
+    GP.BLOCK_END();
+  }
+  GP.BLOCK_END();
+
+  GP.UPDATE("ledSwitch");
+  GP.BUILD_END();
 }
 
+void buildClockUI(Clock c, String prefix) {
+  GP.BOX_BEGIN(GP_CENTER);
+  GP.SPINNER(prefix + ".hour", c.hour, 0, 23);
+  GP.SPAN(":");
+  GP.SPINNER(prefix + ".minute", c.minute, 0, 59);
+  GP.BOX_END();
+}
 
-// tg bot handler
+void uiCallback(GyverPortal& p) { // обработка запросов с ui
+  wifiFormAction(p);
+  tgFormAction(p); 
+  timerFormAction(p);
 
-void handleTgMessage(FB_msg& msg) {
+  ledSwitchAction(p);
+  updateDynamycElsAction(p);
+}
+
+void wifiFormAction(GyverPortal& p) { // обратотка формы wifi
+  if (p.form("/wifi")) {               // кнопка нажата
+    p.copyStr("ssid", CFG.wifi.ssid);  // копируем себе
+    p.copyStr("pass", CFG.wifi.pass);
+    data.update();
+    runWifi();
+  }
+}
+
+void tgFormAction(GyverPortal& p) { // обработка формы телеграм
+  if (p.form("/tg")) {
+    p.copyStr("token", CFG.tg.token);
+    p.copyInt("chatId", CFG.tg.chatId);
+    data.update();
+    bot.setToken(CFG.tg.token);
+    bot.setChatID(CFG.tg.chatId);
+    Serial.print("token: "); Serial.println(CFG.tg.token);
+    Serial.print("chatId: "); Serial.print(CFG.tg.chatId);
+  }
+}
+
+void timerFormAction(GyverPortal& p) { // обратотка формы таймера
+  if (p.form("/timer")) {
+    int timerNum = -1;
+    p.copyInt("timer", timerNum);
+    Serial.print("timer: ");
+    Serial.println(timerNum);
+    if (timerNum < 0 || timerNum >= TIMER_COUNT) {
+      Serial.println("timer not found");
+    } else {
+      Timer t = CFG.timers[timerNum];
+      String beginPref = "begin"; beginPref += timerNum; 
+      String endPref = "end"; endPref += timerNum;
+      String beginHour = beginPref; beginHour += ".hour"; 
+      String beginMinute = beginPref; beginMinute += ".minute";
+      String endHour = endPref; endHour += ".hour"; 
+      String endMinute = endPref; endMinute += ".minute";
+      String onPref = "on"; onPref += timerNum; 
+      p.copyBool(onPref, CFG.timers[timerNum].on); 
+      p.copyInt(beginHour, CFG.timers[timerNum].begin.hour);
+      p.copyInt(beginMinute, CFG.timers[timerNum].begin.minute);
+      p.copyInt(endHour, CFG.timers[timerNum].end.hour);
+      p.copyInt(endMinute, CFG.timers[timerNum].end.minute);
+      Serial.println("== timer ==");
+      Serial.print("on: ");
+      Serial.println(CFG.timers[timerNum].on);
+      Serial.print("begin: ");
+      Serial.print(CFG.timers[timerNum].begin.hour);
+      Serial.print(":");
+      Serial.println(CFG.timers[timerNum].begin.minute);
+      Serial.print("end: ");
+      Serial.print(CFG.timers[timerNum].end.hour);
+      Serial.print(":");
+      Serial.println(CFG.timers[timerNum].end.minute);
+      Serial.println("===========");
+      data.update();
+    }
+  }
+}
+
+void ledSwitchAction(GyverPortal& p) { // обратотка переключения  
+  bool valSwitch;
+  if (ui.clickBool("ledSwitch", valSwitch)) {
+    Serial.print("Switch: ");
+    Serial.println(valSwitch);
+    switchLed(valSwitch);
+  }
+}
+
+void updateDynamycElsAction(GyverPortal& p) { // обновление динамических эл-ов на ui
+  if (ui.update("ledSwitch")) {
+    ui.updateBool("ledSwitch", ledStatus());
+  }
+}
+
+// = tg =======
+String menu = "вкл \t выкл \t статус";
+void tgCallback(FB_msg& msg) { // обработка запросов с tg
   String text = msg.text;
   if (text == "/start") {
     String mess = "Добро пожаловать!";
     mess += " Ваш chatId: ";
     mess += msg.chatID;
-    bot.showMenuText(mess, "/вкл \t /выкл \t /статус", msg.chatID);
+    bot.showMenuText(mess, menu, msg.chatID);
   } else {
-    if (text == "/вкл") {
-      switchLED(true, false);
-      bot.sendMessage("Включено", msg.chatID);
+    if (text == "вкл") {
+      switchLed(true, false);
+      bot.showMenuText("Включено", menu, msg.chatID);
     }
 
-    if (text == "/выкл") {
-      switchLED(false, false);
-      bot.sendMessage("Выключено", msg.chatID);
+    if (text == "выкл") {
+      switchLed(false, false);
+      bot.showMenuText("Выключено", menu, msg.chatID);
     }
 
-    if (text == "/статус") {
+    if (text == "статус") {
       if (ledStatus() == true) {
-        bot.sendMessage("Включено", msg.chatID);
+        bot.showMenuText("Включено", menu, msg.chatID);
       } else {
-        bot.sendMessage("Выключено", msg.chatID);
+        bot.showMenuText("Выключено", menu, msg.chatID);
       }
     }
+
+    // таймер 1 1 08:00 23:00
+    // Serial.println(text.length());
+    // if (text.startsWith("таймер")) {
+    //   if (text == "таймер") {
+    //     bot.showMenuText("Для настройки таймеров введите:\n"
+    //       "таймер <№ таймера> <состояние таймера> [<время вкл> <время выкл>]\n"
+    //       "[] - означает, что параметры внутри не обязательны\n"
+    //       "№ таймера - 1,2,3\n"
+    //       "состояние таймера: 1 - вкл, 0 - выкл\n"
+    //       "<время вкл> <время выкл> - время включения в выключения. формат для указания времени: HH:MM", menu, msg.chatID);
+    //   }
+    //   if (text.length() == 28 || text.length() == 16) {
+    //     int timerNum = text.substring(13, 14).toInt();
+    //     int timerState = text.substring(15, 16).toInt();
+    //     String timerStart = text.substring(17, 22);
+    //     String timerEnd = text.substring(23);
+
+    //     if(timerNum < 1 || timerNum > 3) {
+    //       bot.showMenuText("Ошибка настройки таймера.\nТаймер с указаным номером не существует", menu, msg.chatID);
+    //       return;
+    //     }
+    //     if(timerState != 1 && timerState != 0) {
+    //       bot.showMenuText("Ошибка настройки таймера.\nДля вкл или выкл таймера укажите 1 или 0", menu, msg.chatID);
+    //       return;
+    //     }
+
+    //     Serial.println("timerNum: " + timerNum);
+    //     Serial.println("timerState: " + timerState);
+
+    //     CFG.timers[timerNum].on = timerState;
+
+    //     if (timerStart.length() != 0) {
+
+          
+
+    //       // CFG.timers[timerNum].begin.hour = 
+    //       // CFG.timers[timerNum].begin.minute = 
+    //       // CFG.timers[timerNum].end.hour = 
+    //       // CFG.timers[timerNum].end.minute = 
+
+    //       Serial.println("timerStart: " + timerStart.substring(0, 2).toInt());
+    //     }
+    //     if (timerEnd.length() != 0) {
+    //       Serial.println("timerEnd: " + timerEnd);
+    //     }
+    //   } else {
+    //     bot.showMenuText("ошибка настройки таймера.\nНе известный формат запроса", menu, msg.chatID);
+    //   }
+
+      
+    // }
   }
 }
 
-void sendBotLedState() {
+
+void sendBotLedState() { // отправка состояния в TG
   if (ledStatus() == true) {
     bot.sendMessage("Включено");
   } else {
