@@ -31,6 +31,7 @@ TODO
 #define GMT 3 // часовой пояс
 #define TOUT 10000 // таймаут сохранения данных
 #define REL_PIN D1 // пин
+String menu = "вкл \t выкл \t статус";
 
 // = STRUCT ===
 struct WifiCfg {
@@ -71,6 +72,8 @@ void setup() {
   Serial.println();
 
   pinMode(REL_PIN, OUTPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
+  switchLed(false, false);
   // pre init end
   readSettings(); // читаем из памяти
   runWifi(); // запускаем wifi
@@ -89,7 +92,7 @@ void setup() {
   bot.setChatID(CFG.tg.chatId);
   bot.skipUpdates();
   bot.attach(tgCallback);
-  bot.showMenuText("Я снова в деле", "/вкл \t /выкл \t /статус");
+  bot.showMenuText("Я снова в деле", menu);
   Serial.println("== Tg bot started ==");
 }
 
@@ -108,6 +111,9 @@ void loop() {
 void lightTimerLoop() { // обработка таймеров подсветки
   for (int i = 0; i < TIMER_COUNT; i++) { 
     Timer t = CFG.timers[i];
+    if (!t.on) {
+      continue;
+    }
     if (ntp.hour() == t.begin.hour && ntp.minute() == t.begin.minute && !begin) {
       switchLed(true);
       Serial.println("alarm on");
@@ -128,6 +134,7 @@ bool ledStatus() {
 
 void switchLed(bool on, bool sendAnswerToTg) {
   digitalWrite(REL_PIN, on);
+  digitalWrite(LED_BUILTIN, !on);
    if (sendAnswerToTg) {
     sendBotLedState();
   }
@@ -348,7 +355,6 @@ void updateDynamycElsAction(GyverPortal& p) { // обновление динам
 }
 
 // = tg =======
-String menu = "вкл \t выкл \t статус";
 void tgCallback(FB_msg& msg) { // обработка запросов с tg
   String text = msg.text;
   if (text == "/start") {
