@@ -3,7 +3,7 @@
 #include <LittleFS.h>
 #include <GyverNTP.h>
 #include <FastBot.h>
-// #include <ESP8266NetBIOS.h>
+#include <GParser.h>
 
 /*
 Прошивка для управления фитолентой.
@@ -31,7 +31,7 @@ TODO
 #define GMT 3 // часовой пояс
 #define TOUT 10000 // таймаут сохранения данных
 #define REL_PIN D1 // пин
-String menu = "вкл \t выкл \t статус";
+String menu = "вкл \t выкл \t статус \n таймеры";
 
 // = STRUCT ===
 struct WifiCfg {
@@ -283,8 +283,17 @@ void wifiFormAction(GyverPortal& p) { // обратотка формы wifi
   if (p.form("/wifi")) {               // кнопка нажата
     p.copyStr("ssid", CFG.wifi.ssid);  // копируем себе
     p.copyStr("pass", CFG.wifi.pass);
-    data.update();
-    runWifi();
+    FDstat_t stat = data.updateNow();
+    Serial.print("uptate status: ");
+    switch (stat) {
+      case FD_FS_ERR: Serial.println("FS Error"); break;
+      case FD_FILE_ERR: Serial.println("Error"); break;
+      case FD_WRITE: Serial.println("Data Write"); break;
+      case FD_ADD: Serial.println("Data Add"); break;
+      case FD_READ: Serial.println("Data Read"); break;
+      default: break;
+    }
+    ESP.restart();
   }
 }
 
@@ -309,7 +318,7 @@ void timerFormAction(GyverPortal& p) { // обратотка формы тайм
     if (timerNum < 0 || timerNum >= TIMER_COUNT) {
       Serial.println("timer not found");
     } else {
-      Timer t = CFG.timers[timerNum];
+      Timer timer = CFG.timers[timerNum];
       String beginPref = "begin"; beginPref += timerNum; 
       String endPref = "end"; endPref += timerNum;
       String beginHour = beginPref; beginHour += ".hour"; 
@@ -317,22 +326,22 @@ void timerFormAction(GyverPortal& p) { // обратотка формы тайм
       String endHour = endPref; endHour += ".hour"; 
       String endMinute = endPref; endMinute += ".minute";
       String onPref = "on"; onPref += timerNum; 
-      p.copyBool(onPref, CFG.timers[timerNum].on); 
-      p.copyInt(beginHour, CFG.timers[timerNum].begin.hour);
-      p.copyInt(beginMinute, CFG.timers[timerNum].begin.minute);
-      p.copyInt(endHour, CFG.timers[timerNum].end.hour);
-      p.copyInt(endMinute, CFG.timers[timerNum].end.minute);
+      p.copyBool(onPref, timer.on); 
+      p.copyInt(beginHour, timer.begin.hour);
+      p.copyInt(beginMinute, timer.begin.minute);
+      p.copyInt(endHour, timer.end.hour);
+      p.copyInt(endMinute, timer.end.minute);
       Serial.println("== timer ==");
       Serial.print("on: ");
-      Serial.println(CFG.timers[timerNum].on);
+      Serial.println(timer.on);
       Serial.print("begin: ");
-      Serial.print(CFG.timers[timerNum].begin.hour);
+      Serial.print(timer.begin.hour);
       Serial.print(":");
-      Serial.println(CFG.timers[timerNum].begin.minute);
+      Serial.println(timer.begin.minute);
       Serial.print("end: ");
-      Serial.print(CFG.timers[timerNum].end.hour);
+      Serial.print(timer.end.hour);
       Serial.print(":");
-      Serial.println(CFG.timers[timerNum].end.minute);
+      Serial.println(timer.end.minute);
       Serial.println("===========");
       data.update();
     }
@@ -366,72 +375,82 @@ void tgCallback(FB_msg& msg) { // обработка запросов с tg
     if (text == "вкл") {
       switchLed(true, false);
       bot.showMenuText("Включено", menu, msg.chatID);
+      return;
     }
 
     if (text == "выкл") {
       switchLed(false, false);
       bot.showMenuText("Выключено", menu, msg.chatID);
+      return;
     }
 
     if (text == "статус") {
-      if (ledStatus() == true) {
-        bot.showMenuText("Включено", menu, msg.chatID);
-      } else {
-        bot.showMenuText("Выключено", menu, msg.chatID);
+      String answer = "подсветка: ";
+      answer += ledStatus() == true ? "ВКЛ" : "ВЫКЛ";
+      answer += "\n===========\n";
+
+      answer += "Портал: ";
+      answer += "http://";
+      answer += WiFi.localIP().toString();
+      answer += "\n";
+      
+      answer += "chatId: ";
+      answer += msg.chatID;
+      answer += "\n";
+
+      answer += "== TIMERS ==\n";
+      for (int i = 0; i < TIMER_COUNT; i++) {
+        Timer timer = CFG.timers[i];
+        answer += "#"; answer += String(i);
+        answer += ": "; answer += timer.on ? "ВКЛ" : "ВЫКЛ";
+        answer += " (";
+        answer += String(timer.begin.hour); answer += ":"; answer += String(timer.begin.minute);
+        answer += " - "; 
+        answer += String(timer.end.hour); answer += ":"; answer += String(timer.end.minute);
+        answer += ")\n";
       }
+      answer += "===========\n";
+
+      bot.showMenuText(answer, menu, msg.chatID);
+      return;
     }
 
-    // таймер 1 1 08:00 23:00
-    // Serial.println(text.length());
-    // if (text.startsWith("таймер")) {
-    //   if (text == "таймер") {
-    //     bot.showMenuText("Для настройки таймеров введите:\n"
-    //       "таймер <№ таймера> <состояние таймера> [<время вкл> <время выкл>]\n"
-    //       "[] - означает, что параметры внутри не обязательны\n"
-    //       "№ таймера - 1,2,3\n"
-    //       "состояние таймера: 1 - вкл, 0 - выкл\n"
-    //       "<время вкл> <время выкл> - время включения в выключения. формат для указания времени: HH:MM", menu, msg.chatID);
-    //   }
-    //   if (text.length() == 28 || text.length() == 16) {
-    //     int timerNum = text.substring(13, 14).toInt();
-    //     int timerState = text.substring(15, 16).toInt();
-    //     String timerStart = text.substring(17, 22);
-    //     String timerEnd = text.substring(23);
+    if(text == "timers") {
+      String data = msg.data; // t.[1|2|3].[on|off]
+      GParser data(data, '.');
+      int am = data.amount();
+      if (am < 3) {
+        bot.showMenuText("ошибочная команда", menu, msg.chatID);
+        return;
+      }
+      String timerNum = data.getInt(1);
+      if (timerNum < 0 || timerNum >= TIMER_COUNT) {
+        bot.showMenuText("ошибочная команда", menu, msg.chatID);
+        return;
+      }
+      bool on = data[2] == "on" ? true : false;
+      CFG.timers[i].on = on;
+    }
 
-    //     if(timerNum < 1 || timerNum > 3) {
-    //       bot.showMenuText("Ошибка настройки таймера.\nТаймер с указаным номером не существует", menu, msg.chatID);
-    //       return;
-    //     }
-    //     if(timerState != 1 && timerState != 0) {
-    //       bot.showMenuText("Ошибка настройки таймера.\nДля вкл или выкл таймера укажите 1 или 0", menu, msg.chatID);
-    //       return;
-    //     }
-
-    //     Serial.println("timerNum: " + timerNum);
-    //     Serial.println("timerState: " + timerState);
-
-    //     CFG.timers[timerNum].on = timerState;
-
-    //     if (timerStart.length() != 0) {
-
-          
-
-    //       // CFG.timers[timerNum].begin.hour = 
-    //       // CFG.timers[timerNum].begin.minute = 
-    //       // CFG.timers[timerNum].end.hour = 
-    //       // CFG.timers[timerNum].end.minute = 
-
-    //       Serial.println("timerStart: " + timerStart.substring(0, 2).toInt());
-    //     }
-    //     if (timerEnd.length() != 0) {
-    //       Serial.println("timerEnd: " + timerEnd);
-    //     }
-    //   } else {
-    //     bot.showMenuText("ошибка настройки таймера.\nНе известный формат запроса", menu, msg.chatID);
-    //   }
-
-      
-    // }
+    if(text == "таймеры" || text == "timers") {
+      Serial.println(text);
+      String menu1 = "";
+      String cback1 = "";
+      for (int i = 0; i < TIMER_COUNT; i++) {
+        Timer timer = CFG.timers[i];
+        menu1 += "#"; menu1 += String(i); menu1 += timer.on ? "(Вкл)" : "(Выкл)";
+        if (i + 1 != TIMER_COUNT) {
+          menu1 += "\t";
+        }
+        cback1 += "t."; cback1 += String(i);
+        cback1 += timer.on ? ".off" : ".on";
+        if (i + 1 != TIMER_COUNT) {
+          cback1 += ",";
+        }
+      }
+      Serial.println(menu1);
+      bot.inlineMenuCallback("timers", menu1, cback1, msg.chatID);
+    }
   }
 }
 
